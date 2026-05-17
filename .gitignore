@@ -1,0 +1,30 @@
+# NEVER commit these — API keys and local DB
+secrets.txt
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+bot.log
+
+# OS
+.DS_Store
+Thumbs.db
