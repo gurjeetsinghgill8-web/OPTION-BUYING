@@ -20,7 +20,7 @@ STEP 2: secrets.txt mein apni details bharo
 
 STEP 3: RUN_ALL.bat double-click karo
    → Bot + Dashboard ek saath start
-   → Dashboard: http://157.49.182.222:8503
+   → Dashboard: http://46.224.133.16:8503
 
 ============================================================
 DELTA EXCHANGE API KEY KAISE BANAO:
@@ -42,7 +42,7 @@ TELEGRAM BOT KAISE BANAO:
 4. Apna Chat ID: @userinfobot se milega
 
 ============================================================
-DASHBOARD URL: http://157.49.182.222:8503
+DASHBOARD URL: http://46.224.133.16:8503
 ============================================================
 Yahan se:
 - Trade Mode: PAPER (practice) ya LIVE (real money)
@@ -51,8 +51,11 @@ Yahan se:
 - Position dekho, square off karo
 
 NOTE:
-  46.224.133.16 = VPN IP (sirf Delta Exchange API ke liye)
-  157.49.182.222 = VPS Public IP (dashboard ke liye)
+  46.224.133.16 = Permanent static IP (Delta Exchange + Dashboard dono)
+  Sab dashboards yahi IP pe hain:
+    NSL   → http://46.224.133.16:8502
+    BHARAT→ http://46.224.133.16:8501
+    OB    → http://46.224.133.16:8503
 
 ============================================================
 SUPPORT: Telegram pe message karo
