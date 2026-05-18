@@ -252,6 +252,138 @@ def is_force_close_time():
     now = datetime.datetime.now()
     return now.hour > 15 or (now.hour == 15 and now.minute >= 20)
 
+# ═══════════════════════════════════════════════════════════
+# SELF-HEALING GUARDIAN v2 — qty-aware, dashboard-safe
+# Runs every new candle — BEFORE any trade logic
+# ═══════════════════════════════════════════════════════════
+def _run_guardian():
+    """
+    Smart Guardian v2 — qty-aware, dashboard-safe.
+
+    Logic:
+      expected_qty  = DB active_option_qty  (set from dashboard — 1/5/10 etc)
+      exchange_qty  = actual size on exchange for DB symbol
+      extra_lots    = exchange_qty - expected_qty
+
+      If extra_lots > 0  → sell ONLY the extra lots (not all)
+      If extra_lots == 0 → All good, nothing to do
+      If extra_lots < 0  → Warning only (partial close happened externally)
+      If exchange = 0    → NEVER clear DB (options sync unreliable)
+
+    Example: Dashboard=10 lots, exchange=12 → sells 2 extra only.
+    Example: Dashboard=5 lots, exchange=5  → does nothing.
+    """
+    import hmac as _hmac, hashlib as _hash, json as _json
+    import requests as _req
+
+    api_key    = db.get_param("delta_api_key",    "")
+    api_secret = db.get_param("delta_api_secret", "")
+    db_active  = db.get_param("option_trade_active", "NO")
+    db_symbol  = db.get_param("active_option_symbol", "NONE")
+    db_pid     = db.get_param("active_option_product_id", "0")
+
+    if not api_key or db_active != "YES" or db_symbol == "NONE":
+        return  # Nothing active — skip
+
+    expected_qty = int(db.get_param("active_option_qty", "1") or "1")
+    BASE = "https://api.india.delta.exchange"
+
+    def signed_get(path, query=""):
+        ts  = str(int(time.time()))
+        sig = _hmac.new(api_secret.encode(),
+                        ("GET" + ts + path + query).encode(),
+                        _hash.sha256).hexdigest()
+        h = {"api-key": api_key, "signature": sig,
+             "timestamp": ts, "Content-Type": "application/json"}
+        try:
+            return _req.get(BASE + path + query, headers=h, timeout=8)
+        except Exception:
+            return None
+
+    def signed_post(path, payload_dict):
+        payload = _json.dumps(payload_dict)
+        ts  = str(int(time.time()))
+        sig = _hmac.new(api_secret.encode(),
+                        ("POST" + ts + path + payload).encode(),
+                        _hash.sha256).hexdigest()
+        h = {"api-key": api_key, "signature": sig,
+             "timestamp": ts, "Content-Type": "application/json"}
+        try:
+            return _req.post(BASE + path, headers=h, data=payload, timeout=8)
+        except Exception:
+            return None
+
+    # Fetch exchange position for current symbol
+    resp = signed_get("/v2/positions", "?underlying_asset_symbol=BTC")
+    if not resp or resp.status_code != 200:
+        log_terminal("Guardian: API call failed — skipping", "WARN")
+        return
+
+    exchange_qty = 0
+    exchange_pid = 0
+    for p in resp.json().get("result", []):
+        sym = (p.get("product", {}) or {}).get("symbol", "")
+        sz  = float(p.get("size", 0))
+        pid = (p.get("product", {}) or {}).get("id", 0)
+        if sym == db_symbol and sz > 0:
+            exchange_qty = int(sz)
+            exchange_pid = int(pid or db_pid)
+            break
+
+    extra_lots = exchange_qty - expected_qty
+
+    log_terminal(
+        f"🛡 Guardian: {db_symbol} | Expected={expected_qty} | "
+        f"Exchange={exchange_qty} | Extra={extra_lots}",
+        "INFO"
+    )
+
+    if extra_lots > 0:
+        # Close ONLY the extra lots
+        log_terminal(f"Guardian: Closing {extra_lots} extra lot(s)...", "ALERT")
+        _audit_log(
+            "GUARDIAN",
+            f"EXTRA_LOTS: exchange={exchange_qty}, expected={expected_qty}",
+            f"Selling {extra_lots} extra lot(s) of {db_symbol}"
+        )
+        send_telegram_msg(
+            f"🛡 GUARDIAN ALERT\n"
+            f"Symbol: {db_symbol}\n"
+            f"Exchange: {exchange_qty} lots | Expected: {expected_qty} lots\n"
+            f"Closing {extra_lots} extra lot(s)..."
+        )
+        pid_to_use = exchange_pid or int(db_pid or 0)
+        r = signed_post("/v2/orders", {
+            "product_id":  pid_to_use,
+            "size":        extra_lots,
+            "side":        "sell",
+            "order_type":  "market_order",
+            "reduce_only": True
+        })
+        if r and r.status_code in [200, 201]:
+            _audit_log("GUARDIAN", f"Extra lots closed: {db_symbol}",
+                       f"Sold {extra_lots} | Remaining: {expected_qty}")
+            send_telegram_msg(
+                f"✅ GUARDIAN REPAIRED\n"
+                f"Closed {extra_lots} extra lot(s) of {db_symbol}\n"
+                f"Remaining: {expected_qty} lot(s) as intended"
+            )
+        else:
+            err = r.text[:100] if r else "no response"
+            _audit_log("GUARDIAN", f"Close FAILED: {db_symbol}", err)
+
+    elif extra_lots < 0:
+        # Partial close happened externally — just warn
+        log_terminal(
+            f"Guardian: Exchange has LESS ({exchange_qty}) than expected ({expected_qty}) — "
+            f"partial close externally?", "WARN"
+        )
+        _audit_log("GUARDIAN", f"PARTIAL_CLOSE detected: {db_symbol}",
+                   f"Exchange={exchange_qty}, Expected={expected_qty} — no action taken")
+
+    else:
+        log_terminal(f"Guardian: All OK — {exchange_qty} lot(s) as expected", "INFO")
+
 def is_market_open():
     """
     Returns True during BTC 24x7 trading.
@@ -531,8 +663,8 @@ def run_options_loop():
     _last_processed_candle_ts = latest_closed_ts
     db.set_param("last_processed_candle_ts", str(latest_closed_ts))  # persist to DB
 
-    # ── SELF-HEALING GUARDIAN (disabled — was causing false DB clears) ──
-    # _run_guardian()  # Re-enable after options position endpoint is verified
+    # ── SELF-HEALING GUARDIAN v2 (qty-aware — runs on every new candle) ──
+    _run_guardian()
 
     # ── READ CURRENT STATE ────────────────────────────────
     option_active  = db.get_param("option_trade_active", "NO")
