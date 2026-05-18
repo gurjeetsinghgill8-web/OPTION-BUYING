@@ -372,16 +372,45 @@ def _run_guardian():
             _audit_log("GUARDIAN", f"Close FAILED: {db_symbol}", err)
 
     elif extra_lots < 0:
-        # CRITICAL: Delta Exchange /v2/positions returns 0 even for LIVE
-        # bought options — known API limitation. NEVER clear DB on this.
-        # DB is single source of truth. Only close_option() clears DB.
+        # FIX 3: 3-Candle Cooldown before clearing DB
+        # Delta Exchange /v2/positions returns 0 for bought options (known API limit).
+        # BUT: if position truly expired, we must eventually clear.
+        # Rule: Only clear DB after Exchange=0 for 3 CONSECUTIVE candles.
+        zero_sym   = db.get_param("guardian_zero_symbol", "NONE")
+        zero_count = int(db.get_param("guardian_zero_count", "0") or "0")
+
+        if zero_sym != db_symbol:
+            # Different symbol — reset counter
+            db.set_param("guardian_zero_symbol", db_symbol)
+            zero_count = 1
+        else:
+            zero_count += 1
+        db.set_param("guardian_zero_count", str(zero_count))
+
         log_terminal(
-            f"Guardian: Exchange shows {exchange_qty} for {db_symbol} "
-            f"(expected={expected_qty}). Delta API unreliable — DB unchanged.",
+            f"Guardian: Exchange=0 for {db_symbol} — count={zero_count}/3. "
+            f"{'Watching...' if zero_count < 3 else 'Clearing DB now.'}",
             "WARN"
         )
-        _audit_log("GUARDIAN", f"EXCHANGE_LOW: {db_symbol}",
-                   f"Exchange={exchange_qty}, Expected={expected_qty} — DB unchanged")
+
+        if zero_count >= 3:
+            # 3 consecutive zeros — position truly gone (expired/settled/closed)
+            _audit_log("GUARDIAN", f"EXCHANGE=0 x3: {db_symbol}",
+                       "3 consecutive candles with 0 — auto-clearing DB")
+            send_telegram_msg(
+                f"🛡 GUARDIAN: Position confirmed gone\n"
+                f"Symbol: {db_symbol}\n"
+                f"Exchange=0 for 3 consecutive candles\n"
+                f"→ DB cleared. Reentry blocked 1 candle."
+            )
+            db.clear_option_position()
+            db.set_param("guardian_zero_count", "0")
+            db.set_param("guardian_zero_symbol", "NONE")
+            # Fix 4: block re-entry for exactly 1 candle
+            db.set_param("reentry_blocked_candle_ts", str(_last_processed_candle_ts))
+        else:
+            _audit_log("GUARDIAN", f"EXCHANGE_LOW: {db_symbol}",
+                       f"count={zero_count}/3 — DB unchanged")
 
     else:
         log_terminal(f"Guardian: All OK — {exchange_qty} lot(s) as expected", "INFO")
@@ -581,6 +610,19 @@ def run_options_loop():
         _update_premium_display()
         return
 
+    # ── FIX 4: REENTRY BLOCK (1 candle wait after guardian clear) ──────
+    blocked_ts = int(db.get_param("reentry_blocked_candle_ts", "0") or "0")
+    if blocked_ts > 0:
+        if latest_closed_ts <= blocked_ts:
+            log_terminal(
+                f"⏳ REENTRY BLOCKED — position just cleared, waiting for next candle.",
+                "INFO"
+            )
+            return
+        else:
+            # New candle arrived — unblock
+            db.set_param("reentry_blocked_candle_ts", "0")
+
     # ── STATE MACHINE ─────────────────────────────────────
 
     # [A] FLAT → Fresh entry
@@ -685,13 +727,30 @@ def send_pulse():
 # MAIN ENTRY POINT
 # ═══════════════════════════════════════════════════════════
 def main():
-    # ── Single-instance lock (prevents double-run) ────────
+    # ── FIX 2: Dual-layer single-instance lock ────────────
+    # Layer 1: Socket lock (fast — prevents most duplicates)
     try:
         lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         lock_socket.bind(("127.0.0.1", 47301))  # Port 47301 = options engine
     except socket.error:
-        print("BITCOIN OPTIONS ENGINE ALREADY RUNNING. EXITING.")
+        print("BITCOIN OPTIONS ENGINE ALREADY RUNNING (socket). EXITING.")
         sys.exit(1)
+
+    # Layer 2: PID file lock (catches port-reuse edge cases on restart)
+    PID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "engine.pid")
+    try:
+        if os.path.exists(PID_FILE):
+            try:
+                old_pid = int(open(PID_FILE).read().strip())
+                os.kill(old_pid, 0)  # Signal 0 = check if process alive (Linux)
+                print(f"ENGINE ALREADY RUNNING (PID {old_pid}). EXITING.")
+                sys.exit(1)
+            except (ProcessLookupError, ValueError, PermissionError):
+                print(f"[PID] Stale PID file (old process gone) — cleaning up.")
+        with open(PID_FILE, "w") as _pf:
+            _pf.write(str(os.getpid()))
+    except Exception as _pe:
+        print(f"[PID] Warning: could not manage PID file: {_pe}")
 
     print("=" * 62)
     print("  ⚡ BITCOIN OPTIONS ENGINE v1.0 — SUPERTREND")

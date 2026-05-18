@@ -612,7 +612,34 @@ def close_option(reason="MANUAL"):
         "order_type":  "market_order",
         "reduce_only": True
     }
-    resp = _post("/v2/orders", payload_dict)
+
+    # ── RETRY LOGIC: up to 3 attempts on network failure ──────
+    resp = None
+    for _attempt in range(1, 4):
+        resp = _post("/v2/orders", payload_dict)
+        if resp is not None:
+            break
+        if _attempt < 3:
+            log_terminal(f"⚠️ Close attempt {_attempt}/3 — No response. Retry in 5s...", "WARN")
+            send_telegram_msg(
+                f"⚠️ CLOSE RETRY {_attempt}/3\n"
+                f"Symbol: {symbol}\n"
+                f"Retrying in 5 seconds..."
+            )
+            time.sleep(5)
+
+    if resp is None:
+        # All 3 retries exhausted — auto-pause engine, alert user
+        log_terminal("❌ CLOSE FAILED after 3 retries — No response. Engine AUTO-PAUSED.", "ERROR")
+        send_telegram_msg(
+            f"❌ OPTION CLOSE FAILED (3 retries)\n"
+            f"Symbol : {symbol}\n"
+            f"Error  : No response after 3 attempts\n"
+            f"⚠️ MANUAL ACTION NEEDED on Delta Exchange!\n"
+            f"Engine AUTO-PAUSED — press ▶ START on dashboard."
+        )
+        db.set_param("algo_running", "OFF")  # pause engine — human must verify + restart
+        return False, 0.0, 0.0
 
     if resp and resp.status_code in [200, 201]:
         # Wait for fill then get actual exit price
