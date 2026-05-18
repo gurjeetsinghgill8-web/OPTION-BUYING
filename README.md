@@ -13,7 +13,7 @@ BHARAT-FUTURES-ENGINE/
 ├── utils.py             ← Telegram + terminal logging
 ├── futures_executor.py  ← Delta Exchange Futures API
 ├── main.py              ← Trading engine (Magic Line logic)
-├── app.py               ← Streamlit Dashboard (port 8600)
+├── app.py               ← Streamlit Dashboard (port 8503)
 ├── requirements.txt     ← pip install -r requirements.txt
 ├── SETUP.bat            ← First time setup
 ├── RUN_DASHBOARD.bat    ← Open dashboard
@@ -37,7 +37,7 @@ TRADE_MODE=PAPER
 Double-click `SETUP.bat`
 
 ### Step 3 — Run Dashboard
-Double-click `RUN_DASHBOARD.bat` → opens at http://localhost:8600
+Double-click `RUN_DASHBOARD.bat` → opens at http://46.224.133.16:8503
 
 ### Step 4 — Run Bot
 Double-click `RUN_BOT.bat` (in a separate window)
@@ -55,7 +55,7 @@ Double-click `RUN_BOT.bat` (in a separate window)
 
 ---
 
-## ⚙️ Dashboard Controls (port 8600)
+## ⚙️ Dashboard Controls (port 8503)
 - **START / STOP ENGINE** — Control the bot
 - **SQUARE OFF ALL** — Emergency close all positions
 - **HARD RESET DB** — Clear stuck/zombie state
@@ -71,7 +71,7 @@ Double-click `RUN_BOT.bat` (in a separate window)
 | Old Bot | New Bot |
 |---|---|
 | Option Selling (Calls & Puts) | BTC Perpetual Futures |
-| Port 8501 | Port 8600 |
+| Port 8501 | Port 8503 |
 | trading_app.db | futures_engine.db |
 | Old Telegram Bot | New Telegram Bot |
 | Old API Keys | New API Keys |

@@ -20,7 +20,7 @@ STEP 2: secrets.txt mein apni details bharo
 
 STEP 3: RUN_ALL.bat double-click karo
    → Bot + Dashboard ek saath start
-   → Dashboard: http://localhost:8600
+   → Dashboard: http://46.224.133.16:8503
 
 ============================================================
 DELTA EXCHANGE API KEY KAISE BANAO:
@@ -42,7 +42,7 @@ TELEGRAM BOT KAISE BANAO:
 4. Apna Chat ID: @userinfobot se milega
 
 ============================================================
-DASHBOARD URL: http://localhost:8600
+DASHBOARD URL: http://46.224.133.16:8503
 ============================================================
 Yahan se:
 - Trade Mode: PAPER (practice) ya LIVE (real money)

@@ -330,13 +330,21 @@ def find_strike(side, distance_type, btc_price, chain, expiry):
     if distance_type == "ATM":
         idx = atm_idx
     elif distance_type.startswith("OTM"):
-        step = int(distance_type[3:])  # OTM1→1, OTM2→2 etc.
+        suffix = distance_type[3:]  # OTM1→"1", OTM→""
+        try:
+            step = int(suffix) if suffix else 1  # bare "OTM" defaults to OTM1
+        except ValueError:
+            step = 1
         if side.upper() == "CALL":
             idx = min(atm_idx + step, len(filtered) - 1)  # CALL OTM = higher strikes
         else:
             idx = max(atm_idx - step, 0)                  # PUT OTM = lower strikes
     elif distance_type.startswith("ITM"):
-        step = int(distance_type[3:])  # ITM1→1, ITM2→2 etc.
+        suffix = distance_type[3:]  # ITM1→"1", ITM→""
+        try:
+            step = int(suffix) if suffix else 1  # bare "ITM" defaults to ITM1
+        except ValueError:
+            step = 1
         if side.upper() == "CALL":
             idx = max(atm_idx - step, 0)                  # CALL ITM = lower strikes
         else:
