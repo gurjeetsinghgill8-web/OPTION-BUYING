@@ -17,6 +17,7 @@ import time
 import datetime
 import socket
 import sys
+import os
 import traceback
 import pandas as pd
 import numpy as np
@@ -263,7 +264,185 @@ def is_market_open():
     return True
 
 # ═══════════════════════════════════════════════════════════
+# AUDIT LOG SYSTEM
+# ═══════════════════════════════════════════════════════════
+AUDIT_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audit.log")
+
+def _audit_log(event, reason, action):
+    """
+    Writes a structured entry to audit.log.
+    Format: [YYYY-MM-DD HH:MM:SS] EVENT | REASON | ACTION
+    """
+    ts  = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {event} | {reason} | {action}\n"
+    try:
+        with open(AUDIT_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception as e:
+        print(f"[AUDIT LOG ERR] {e}")
+    log_terminal(f"[AUDIT] {event} — {action}", "ALERT")
+
+# ═══════════════════════════════════════════════════════════
+# SELF-HEALING GUARDIAN
+# Runs every 5 min loop — BEFORE any trade logic
+# ═══════════════════════════════════════════════════════════
+def _run_guardian():
+    """
+    Self-healing guardian — checks for ghost/extra positions.
+
+    Rules:
+    1. Exchange has 0 positions BUT DB says ACTIVE
+       → DB stuck — reset to FLAT, audit log entry
+    2. Exchange has 2+ positions (ghost trade)
+       → Keep the one matching DB symbol, close all others
+       → Audit log + Telegram alert
+    3. Exchange has exactly 1 position matching DB → All OK
+    """
+    log_terminal("🛡 Guardian check starting...", "INFO")
+
+    api_key = db.get_param("delta_api_key", "")
+    if not api_key:
+        return  # No credentials — skip silently
+
+    # Fetch live positions from exchange
+    try:
+        positions = oe.sync_option_position()  # returns bool
+        # Re-read DB state after sync
+        db_active = db.get_param("option_trade_active", "NO")
+        db_symbol = db.get_param("active_option_symbol", "NONE")
+    except Exception as e:
+        log_terminal(f"Guardian: sync failed — {e}", "WARN")
+        return
+
+    # Fetch raw positions for multi-position check
+    import hmac, hashlib, requests as req_mod
+    try:
+        api_secret = db.get_param("delta_api_secret", "")
+        ts_str     = str(int(time.time()))
+        path       = "/v2/positions"
+        query      = "?underlying_asset_symbol=BTC"
+        sig_data   = "GET" + ts_str + path + query
+        signature  = hmac.new(
+            api_secret.encode("utf-8"),
+            sig_data.encode("utf-8"),
+            hashlib.sha256
+        ).hexdigest()
+        headers = {
+            "api-key":      api_key,
+            "signature":    signature,
+            "timestamp":    ts_str,
+            "Content-Type": "application/json"
+        }
+        resp = req_mod.get(
+            f"https://api.india.delta.exchange{path}{query}",
+            headers=headers, timeout=8
+        )
+        if resp.status_code != 200:
+            return
+        raw = resp.json().get("result", [])
+    except Exception as e:
+        log_terminal(f"Guardian: raw fetch failed — {e}", "WARN")
+        return
+
+    # Filter only open BTC option positions
+    open_opts = [
+        p for p in raw
+        if float(p.get("size", 0)) > 0
+        and (
+            (p.get("product", {}).get("symbol") or "").startswith(("C-BTC", "P-BTC"))
+            or (p.get("symbol", "")).startswith(("C-BTC", "P-BTC"))
+        )
+    ]
+
+    count = len(open_opts)
+    log_terminal(f"Guardian: Exchange has {count} open BTC option position(s)", "INFO")
+
+    # Case 1: More than 1 position — GHOST TRADE detected
+    if count > 1:
+        msg = (
+            f"🛡 GUARDIAN ALERT\n"
+            f"Exchange: {count} positions found\n"
+            f"Expected: 1 (max)\n"
+            f"Action: Closing extras now..."
+        )
+        send_telegram_msg(msg)
+        _audit_log(
+            "GUARDIAN",
+            f"GHOST_TRADE — {count} positions on exchange, expected 1",
+            f"Closing {count - 1} extra position(s)"
+        )
+
+        # Keep the one matching DB symbol, close the rest
+        for p in open_opts:
+            sym = p.get("product", {}).get("symbol") or p.get("symbol", "")
+            if sym == db_symbol:
+                continue  # keep this one
+            # Close the extra
+            pid  = p.get("product_id") or p.get("product", {}).get("id")
+            size = int(float(p.get("size", 0)))
+            try:
+                import json
+                payload = json.dumps({
+                    "product_id": int(pid),
+                    "size":       size,
+                    "side":       "sell",
+                    "order_type": "market_order",
+                    "reduce_only": True
+                })
+                ts2 = str(int(time.time()))
+                p2  = "/v2/orders"
+                sd2 = "POST" + ts2 + p2 + "" + payload
+                sig2 = hmac.new(
+                    api_secret.encode("utf-8"),
+                    sd2.encode("utf-8"),
+                    hashlib.sha256
+                ).hexdigest()
+                hdr2 = {
+                    "api-key":      api_key,
+                    "signature":    sig2,
+                    "timestamp":    ts2,
+                    "Content-Type": "application/json"
+                }
+                r2 = req_mod.post(
+                    f"https://api.india.delta.exchange{p2}",
+                    headers=hdr2, data=payload, timeout=8
+                )
+                if r2.status_code in [200, 201]:
+                    _audit_log(
+                        "GUARDIAN",
+                        f"GHOST closed: {sym}",
+                        f"Market sell order placed — size={size}"
+                    )
+                    send_telegram_msg(
+                        f"🛡 GUARDIAN REPAIRED\n"
+                        f"Ghost position closed: {sym}\n"
+                        f"Size: {size}"
+                    )
+                else:
+                    _audit_log("GUARDIAN", f"Close FAILED for {sym}", r2.text[:100])
+            except Exception as ce:
+                _audit_log("GUARDIAN", f"Exception closing {sym}", str(ce)[:100])
+
+    # Case 2: DB says ACTIVE but exchange shows nothing — DB stuck
+    elif count == 0 and db_active == "YES":
+        _audit_log(
+            "GUARDIAN",
+            "DB_MISMATCH — DB=ACTIVE, Exchange=FLAT (expired or closed externally)",
+            "Reset DB to FLAT"
+        )
+        send_telegram_msg(
+            "🛡 GUARDIAN SYNC FIX\n"
+            "DB showed ACTIVE but exchange is FLAT\n"
+            "→ DB reset to FLAT state"
+        )
+        db.clear_option_position()
+
+    else:
+        log_terminal(f"Guardian: All OK — {count} position(s), DB={db_active}", "INFO")
+
+# ═══════════════════════════════════════════════════════════
 # MAIN SIGNAL LOOP
+
 # ═══════════════════════════════════════════════════════════
 def run_options_loop():
     """
@@ -341,6 +520,9 @@ def run_options_loop():
     )
     _last_processed_candle_ts = latest_closed_ts
 
+    # ── SELF-HEALING GUARDIAN (runs on every new candle) ──
+    _run_guardian()
+
     # ── READ CURRENT STATE ────────────────────────────────
     option_active  = db.get_param("option_trade_active", "NO")
     active_side    = db.get_param("active_option_side",  "NONE")  # CALL or PUT
@@ -349,23 +531,38 @@ def run_options_loop():
     oe.sync_option_position()
     option_active = db.get_param("option_trade_active", "NO")  # re-read after sync
 
-    # ── COLLECT ENTRY PARAMS ──────────────────────────────
-    distance_type  = db.get_param("distance_type",  "OTM")
-    expiry_pref    = db.get_param("expiry_pref",    "AUTO")  # AUTO = nearest weekly
+    # ── COLLECT ENTRY PARAMS ──────────────────────────────────
+    distance_type  = db.get_param("distance_type",  "OTM2")
+    # expiry_mode = key used by dashboard (app.py saves this key)
+    expiry_pref    = db.get_param("expiry_mode",    "1DTE")
     qty            = int(db.get_param("trade_size", "1") or "1")
 
     def _enter_position(side):
-        """Helper: fetch chain, find strike, buy option."""
-        chain  = oe.get_option_chain()
+        """Helper: fetch chain, find strike, buy option with smart expiry fallback."""
+        chain = oe.get_option_chain()
         if not chain:
             log_terminal("Chain fetch failed — cannot enter.", "ERROR")
             return False
-        if expiry_pref == "AUTO":
-            expiry = oe.get_nearest_expiry(chain)
-        else:
-            expiry = expiry_pref
+        expiry = oe.resolve_expiry(chain, expiry_pref)
+        if expiry:
+            test = [p for p in chain if p["type"] == side.upper() and p["expiry"] == expiry]
+            if not test:
+                log_terminal(f"No {side} options for {expiry_pref} ({expiry}) — trying fallback", "WARN")
+                expiry = None
         if not expiry:
-            log_terminal("No valid expiry found — cannot enter.", "ERROR")
+            for fb in ["1DTE", "2DTE", "0DTE", "3DTE", "NEAREST_WEEKLY"]:
+                if fb == expiry_pref:
+                    continue
+                candidate = oe.resolve_expiry(chain, fb)
+                if candidate:
+                    test2 = [p for p in chain if p["type"] == side.upper() and p["expiry"] == candidate]
+                    if test2:
+                        log_terminal(f"Expiry fallback: {expiry_pref} not found, using {fb} ({candidate})", "INFO")
+                        _audit_log("ENGINE", f"Expiry fallback: {expiry_pref} unavailable", f"Using {fb} ({candidate})")
+                        expiry = candidate
+                        break
+        if not expiry:
+            log_terminal("No valid expiry found in any fallback — cannot enter.", "ERROR")
             return False
         product = oe.find_strike(side, distance_type, last_close, chain, expiry)
         if not product:
@@ -500,15 +697,13 @@ def main():
 
     # ── Set engine defaults (only if not already set by user) ─
     defaults = {
-        "trade_size":       "1",
-        "trade_mode":       "PAPER",
-        "timeframe":        "15m",
-        "st_period":        "10",
-        "st_multiplier":    "1.0",
-        "distance_type":    "OTM",
-        "otm_offset":       "2000",
-        "itm_offset":       "5000",
-        "expiry_pref":      "AUTO",
+        "trade_size":         "1",
+        "trade_mode":         "PAPER",
+        "timeframe":          "15m",
+        "st_period":          "10",
+        "st_multiplier":      "1.0",
+        "distance_type":      "OTM2",     # 2 strikes OTM
+        "expiry_mode":        "1DTE",     # 1 day to expiry (dashboard key)
         "force_closed_today": "NO",
     }
     for k, v in defaults.items():

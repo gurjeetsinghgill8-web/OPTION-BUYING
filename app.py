@@ -390,7 +390,7 @@ else:
 st.divider()
 st.markdown("""
 <div style='text-align:center;color:#5ba3c9;font-size:11px;'>
-  ₿ BITCOIN OPTIONS ENGINE v1.0 · SuperTrend 15m · Delta Exchange India · Port 8501
+  ₿ BITCOIN OPTIONS ENGINE v2.0 · SuperTrend 15m · Delta Exchange India · Dashboard: http://157.49.182.222:8503
 </div>""", unsafe_allow_html=True)
 
 # Auto-refresh every 30s
