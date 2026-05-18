@@ -246,11 +246,10 @@ def get_supertrend_signal():
 # ═══════════════════════════════════════════════════════════
 def is_force_close_time():
     """
-    Returns True after 3:20 PM IST — force-close everything.
-    Options lose value fast near 3:30 close — exit by 3:20.
+    BTC Options trade 24x7 — NO force-close.
+    Disabled: was incorrectly blocking trading from 3:20 PM → midnight.
     """
-    now = datetime.datetime.now()
-    return now.hour > 15 or (now.hour == 15 and now.minute >= 20)
+    return False  # BTC is 24x7 — never force-close
 
 # ═══════════════════════════════════════════════════════════
 # SELF-HEALING GUARDIAN v2 — qty-aware, dashboard-safe
@@ -373,13 +372,16 @@ def _run_guardian():
             _audit_log("GUARDIAN", f"Close FAILED: {db_symbol}", err)
 
     elif extra_lots < 0:
-        # Partial close happened externally — just warn
+        # CRITICAL: Delta Exchange /v2/positions returns 0 even for LIVE
+        # bought options — known API limitation. NEVER clear DB on this.
+        # DB is single source of truth. Only close_option() clears DB.
         log_terminal(
-            f"Guardian: Exchange has LESS ({exchange_qty}) than expected ({expected_qty}) — "
-            f"partial close externally?", "WARN"
+            f"Guardian: Exchange shows {exchange_qty} for {db_symbol} "
+            f"(expected={expected_qty}). Delta API unreliable — DB unchanged.",
+            "WARN"
         )
-        _audit_log("GUARDIAN", f"PARTIAL_CLOSE detected: {db_symbol}",
-                   f"Exchange={exchange_qty}, Expected={expected_qty} — no action taken")
+        _audit_log("GUARDIAN", f"EXCHANGE_LOW: {db_symbol}",
+                   f"Exchange={exchange_qty}, Expected={expected_qty} — DB unchanged")
 
     else:
         log_terminal(f"Guardian: All OK — {exchange_qty} lot(s) as expected", "INFO")
@@ -465,10 +467,8 @@ def run_options_loop():
             db.set_param("force_closed_today", "YES")
         return
 
-    # Reset force-close flag at midnight
-    now = datetime.datetime.now()
-    if now.hour == 0 and now.minute < 10:
-        db.set_param("force_closed_today", "NO")
+    # BTC is 24x7 — force_closed_today always stays NO
+    db.set_param("force_closed_today", "NO")
 
     # ── PROFIT TARGET CHECK (every cycle — not just on new candle) ────
     # This runs BEFORE the candle check — 2x can happen anytime
@@ -557,6 +557,29 @@ def run_options_loop():
             return False
         success, entry_px, trade_id = oe.buy_option(product, qty, side, distance_type)
         return success
+
+    # ── ALLOWED SIGNAL FILTER (CALL-only / PUT-only / BOTH) ──
+    # Dashboard sets 'allowed_signal' = "CALL" | "PUT" | "BOTH"
+    allowed_signal = db.get_param("allowed_signal", "BOTH").upper().strip()
+    if allowed_signal in ("CALL", "PUT") and signal != allowed_signal:
+        log_terminal(
+            f"🚫 Signal={signal} blocked — engine set to {allowed_signal}-only mode.",
+            "INFO"
+        )
+        # If we are holding the wrong side, close it now
+        if option_active == "YES" and active_side not in ("NONE", allowed_signal):
+            log_terminal(
+                f"🔄 Closing {active_side} — not in allowed mode ({allowed_signal}-only).",
+                "ALERT"
+            )
+            send_telegram_msg(
+                f"🔄 MODE CHANGE CLOSE\n"
+                f"Closing {active_side} — engine is now {allowed_signal}-only mode.\n"
+                f"→ Will only enter {allowed_signal} trades from now."
+            )
+            oe.close_option(reason="MODE_CHANGE")
+        _update_premium_display()
+        return
 
     # ── STATE MACHINE ─────────────────────────────────────
 

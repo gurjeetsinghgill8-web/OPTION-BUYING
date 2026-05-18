@@ -75,16 +75,18 @@ def _get(path, query_string="", auth=False):
 def _post(path, payload_dict):
     """
     POST request (authenticated). India endpoint only — no fallback for orders.
-    Returns full response JSON or None.
+    Returns full response object or None on network exception.
     """
     try:
         payload = json.dumps(payload_dict)
         headers = _auth_headers("POST", path, payload=payload)
         resp    = requests.post(f"{BASE_URL}{path}", headers=headers,
                                 data=payload, timeout=10)
+        if resp.status_code not in [200, 201]:
+            log_terminal(f"[POST] HTTP {resp.status_code} | {path} | {resp.text[:200]}", "WARN")
         return resp
     except Exception as e:
-        log_terminal(f"[POST ERR] {path}: {e}", "ERROR")
+        log_terminal(f"[POST ERR] {path}: {type(e).__name__}: {e}", "ERROR")
         return None
 
 # ═══════════════════════════════════════════════════════════
@@ -641,16 +643,49 @@ def close_option(reason="MANUAL"):
             f"Reason    : {reason}"
         )
         return True, actual_exit, pnl
-    else:
-        err = resp.text[:200] if resp else "No response"
-        log_terminal(f"OPTION CLOSE FAILED: {err}", "ERROR")
-        send_telegram_msg(
-            f"❌ OPTION CLOSE FAILED\n"
-            f"Symbol : {symbol}\n"
-            f"Error  : {err[:100]}\n"
-            f"⚠️ MANUAL ACTION NEEDED on Delta Exchange!"
-        )
-        return False, 0.0, 0.0
+
+    # ── HANDLE: position already gone on exchange (expired/settled/manually closed)
+    # Delta returns HTTP 400 + {"error":{"code":"no_position_for_reduce_only"}}
+    # This means we are already FLAT on exchange — safe to clear DB state.
+    if resp and resp.status_code == 400:
+        try:
+            err_body = resp.json()
+            err_code = err_body.get("error", {}).get("code", "")
+        except Exception:
+            err_code = ""
+
+        if err_code == "no_position_for_reduce_only":
+            log_terminal(
+                f"⚠️ OPTION ALREADY GONE from exchange (no_position_for_reduce_only).\n"
+                f"Position was likely expired/settled/manually closed.\n"
+                f"Auto-clearing DB state so engine can re-enter. Symbol={symbol}",
+                "ALERT"
+            )
+            # Use last known price for PnL record
+            actual_exit = exit_premium  # best estimate we have
+            pnl = (actual_exit - entry_px) * qty
+            if trade_id > 0:
+                db.close_option_trade(trade_id, actual_exit, round(pnl, 4), "POSITION_EXPIRED_ON_EXCHANGE")
+            db.clear_option_position()
+            send_telegram_msg(
+                f"⚠️ OPTION POSITION EXPIRED/GONE\n"
+                f"Symbol   : {symbol}\n"
+                f"Exchange : No position found (reduce_only rejected)\n"
+                f"Action   : DB auto-cleared — engine is now FLAT\n"
+                f"Est. PnL : {pnl:+.2f} USD\n"
+                f"Reason   : {reason}"
+            )
+            return True, actual_exit, pnl  # Treat as success — we ARE flat now
+
+    err = resp.text[:200] if resp else "No response"
+    log_terminal(f"OPTION CLOSE FAILED: {err}", "ERROR")
+    send_telegram_msg(
+        f"❌ OPTION CLOSE FAILED\n"
+        f"Symbol : {symbol}\n"
+        f"Error  : {err[:100]}\n"
+        f"⚠️ MANUAL ACTION NEEDED on Delta Exchange!"
+    )
+    return False, 0.0, 0.0
 
 # ═══════════════════════════════════════════════════════════
 # SECTION 7 — SYNC POSITION FROM EXCHANGE
