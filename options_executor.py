@@ -55,7 +55,8 @@ def _auth_headers(method, path, payload="", query_string=""):
 def _get(path, query_string="", auth=False):
     """
     GET request with India → Global fallback.
-    Returns parsed JSON 'result' or None on failure.
+    Returns parsed JSON 'result' list on success (HTTP 200), or None on any failure.
+    IMPORTANT: Returns None (not []) on 401/error — callers must check for None.
     """
     for base in [BASE_URL, FALLBACK_URL]:
         try:
@@ -63,12 +64,13 @@ def _get(path, query_string="", auth=False):
             headers = _auth_headers("GET", path, query_string=query_string) if auth else {}
             resp    = requests.get(url, headers=headers, timeout=10)
             if resp.status_code == 200:
-                return resp.json().get("result", [])
+                return resp.json().get("result", [])  # [] = confirmed empty
             else:
                 print(f"[GET] {base}{path} → HTTP {resp.status_code}: {resp.text[:120]}")
+                # Do NOT return [] on error — return None so callers know it failed
         except Exception as e:
             print(f"[GET ERR] {base}{path}: {e}")
-    return None
+    return None  # All endpoints failed — caller must NOT clear DB based on this
 
 def _post(path, payload_dict):
     """
@@ -656,11 +658,19 @@ def close_option(reason="MANUAL"):
 
 def sync_option_position():
     """
-    Reads live option positions from Delta Exchange.
-    Updates DB if the exchange shows a position we don't know about,
-    OR clears DB if exchange shows no position but DB says YES.
+    READ-ONLY sync — updates premium/upnl from exchange if position found.
+    NEVER clears DB. DB is ground truth for option state.
 
-    Returns: True if position found on exchange, False if flat.
+    Position exits only via:
+      - 2x target hit (check_profit_target)
+      - Signal flip (run_options_loop state machine)
+      - End-of-day 3:20 PM IST close
+      - Manual: Dashboard "Square Off" button
+
+    NOTE: Delta Exchange /v2/positions does NOT reliably return bought BTC
+    options. Do NOT use it to determine if we are flat.
+
+    Returns: True if position confirmed on exchange, False otherwise.
     """
     api_key = db.get_param("delta_api_key", "")
     if not api_key:
@@ -671,43 +681,31 @@ def sync_option_position():
     result = _get(path, query, auth=True)
 
     if result is None:
-        log_terminal("sync_option_position: API call failed", "WARN")
+        log_terminal("sync: API call failed — DB unchanged", "WARN")
         return False
 
-    # Find any open option position (not perpetual futures)
     option_found = False
     for p in result:
         sz = float(p.get("size", 0))
         if sz == 0:
             continue
         symbol = p.get("product", {}).get("symbol") or p.get("symbol", "")
-        # BTC options use format C-BTC-XXXXX-DDMMYY or P-BTC-XXXXX-DDMMYY
         if symbol.startswith("C-BTC") or symbol.startswith("P-BTC"):
             option_found = True
-            # Update DB with live position data
             entry_px = float(p.get("avg_entry_price", 0))
             upnl     = float(p.get("unrealized_pnl",  0))
-            db.set_param("active_option_entry_px", str(entry_px))
-            db.set_param("option_unrealized_pnl",  str(round(upnl, 4)))
+            if entry_px > 0:
+                db.set_param("active_option_entry_px", str(entry_px))
+            db.set_param("option_unrealized_pnl", str(round(upnl, 4)))
             log_terminal(
-                f"[SYNC] Exchange option: {symbol} | Size={sz} | Entry={entry_px:.2f} | uPnL={upnl:+.4f}",
+                f"[SYNC] Found: {symbol} | Size={sz} | Entry={entry_px:.2f} | uPnL={upnl:+.4f}",
                 "INFO"
             )
             break
 
+    # SYNC NEVER CLEARS DB — exchange endpoint unreliable for bought options
     if not option_found:
-        local_active = db.get_param("option_trade_active", "NO")
-        if local_active == "YES":
-            log_terminal(
-                "[SYNC] Exchange shows NO option position but DB says YES — clearing DB.",
-                "ALERT"
-            )
-            db.clear_option_position()
-            send_telegram_msg(
-                "⚠️ SYNC ALERT\n"
-                "Exchange: 0 option positions\n"
-                "DB was showing ACTIVE — cleared automatically."
-            )
+        log_terminal("sync: 0 options on endpoint — DB unchanged (by design)", "INFO")
 
     return option_found
 

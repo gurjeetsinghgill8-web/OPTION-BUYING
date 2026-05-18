@@ -74,9 +74,9 @@ def _check_vpn_guard():
 
 # ═══════════════════════════════════════════════════════════
 # CANDLE-CHANGE GUARD
-# Only act ONCE per fully closed 15m candle — not mid-candle
+# Stored in DB — survives restarts — prevents re-entry on same candle
 # ═══════════════════════════════════════════════════════════
-_last_processed_candle_ts = 0
+_last_processed_candle_ts = 0  # loaded from DB in run_options_loop()
 
 # ═══════════════════════════════════════════════════════════
 # SUPERTREND CALCULATOR (pure math — same as proven futures engine)
@@ -455,6 +455,16 @@ def run_options_loop():
     """
     global _last_processed_candle_ts
 
+    # Load candle TS from DB on first call (survives restarts)
+    if _last_processed_candle_ts == 0:
+        saved_ts = db.get_param("last_processed_candle_ts", "0")
+        try:
+            _last_processed_candle_ts = int(float(saved_ts or "0"))
+        except Exception:
+            _last_processed_candle_ts = 0
+        if _last_processed_candle_ts > 0:
+            log_terminal(f"[GUARD] Loaded candle TS from DB: {_last_processed_candle_ts}", "INFO")
+
     if db.get_param("algo_running", "OFF") == "OFF":
         log_terminal("Engine is OFF — skipping loop.", "INFO")
         return
@@ -512,22 +522,25 @@ def run_options_loop():
         _update_premium_display()
         return
 
-    # New candle detected
+    # New candle detected — save TS to DB immediately (restart-safe)
     log_terminal(
         f"🕯 NEW 15m CANDLE CLOSED (ts={latest_closed_ts}) "
         f"| Close={last_close:.0f} | ST={st_value:.0f} | Signal={signal}",
         "INFO"
     )
     _last_processed_candle_ts = latest_closed_ts
+    db.set_param("last_processed_candle_ts", str(latest_closed_ts))  # persist to DB
 
-    # ── SELF-HEALING GUARDIAN (runs on every new candle) ──
-    _run_guardian()
+    # ── SELF-HEALING GUARDIAN (disabled — was causing false DB clears) ──
+    # _run_guardian()  # Re-enable after options position endpoint is verified
 
     # ── READ CURRENT STATE ────────────────────────────────
     option_active  = db.get_param("option_trade_active", "NO")
     active_side    = db.get_param("active_option_side",  "NONE")  # CALL or PUT
 
-    # ── SYNC with exchange (trust exchange over DB) ────────
+    # ── SYNC with exchange (read-only — never clears DB here) ─────
+    # Sync only updates entry_px/upnl if position found on exchange.
+    # DB is ground truth — sync does NOT clear DB in this call.
     oe.sync_option_position()
     option_active = db.get_param("option_trade_active", "NO")  # re-read after sync
 
